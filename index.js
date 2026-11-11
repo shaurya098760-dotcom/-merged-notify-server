@@ -70,11 +70,14 @@ function computeDepositCredit(paidAmount, offerData) {
 
 app.post("/webhook/zapupi", async (req, res) => {
   try {
-    const data = req.body || {};
-    console.log("[zap-webhook] Webhook body:", JSON.stringify(data));
+        const raw = req.body || {};
+    const data = raw.result && typeof raw.result === "object" ? { ...raw, ...raw.result } : raw;
+    console.log("[zap-webhook] Webhook body:", JSON.stringify(raw));
 
-    const orderId = data.order_id || data.orderId || data.txn_id || "";
-    const status = (data.status || data.payment_status || "").toString().toLowerCase();
+    const orderId =
+      data.order_id || data.orderId || data.client_order_id || data.merchant_order_id ||
+      data.remark1 || data.txn_id || "";
+    const status = String(data.status ?? data.payment_status ?? data.txn_status ?? "").toLowerCase();
     const amount = parseFloat(data.amount || data.pay_amount || data.txn_amount || 0);
     const txnId = data.txn_id || data.txnId || data.transaction_id || "";
     const utr = data.utr || data.UTR || "";
@@ -83,7 +86,7 @@ app.post("/webhook/zapupi", async (req, res) => {
       return res.status(200).json({ status: "ok", msg: "no order_id" });
     }
 
-    if (status !== "success" && status !== "completed" && status !== "paid") {
+        if (!["success", "completed", "paid", "true", "1"].includes(status)) {
       console.log("[zap-webhook] Not success:", status);
       return res.status(200).json({ status: "ok" });
     }
