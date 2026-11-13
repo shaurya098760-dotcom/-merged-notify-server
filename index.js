@@ -3,6 +3,20 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
+// ============================================================
+// FIX #1: CRASH LOOP ROKNE KE LIYE
+// Pehle koi bhi unhandled error (jaise quota exceeded) poore server ko
+// crash kar deta tha -> Render restart karta tha -> har restart par saari
+// collections dobara padhi jaati thi -> aur reads kharch hote the.
+// Ab error sirf log hoga, server crash nahi hoga.
+// ============================================================
+process.on("unhandledRejection", (reason) => {
+  console.error("[server] unhandledRejection:", reason && reason.message ? reason.message : reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[server] uncaughtException:", err && err.message ? err.message : err);
+});
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -10,13 +24,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // ============================================================
 // FIREBASE ADMIN INIT — 3 ALAG PROJECTS, 3 ALAG NAMED APPS
-//
-// FireXBattle app (zap-webhook + arenax-notify-server + refer-system)
-// teeno hi isi ek Firebase project ko use karte the, isliye ek hi
-// service account se teeno chal jaate hain.
-//
-// Shubh Sankalp aur ATC — inke apne apne alag Firebase projects hain,
-// isliye inke liye alag service accounts / alag named apps chahiye.
 // ============================================================
 
 const firexServiceAccount = JSON.parse(process.env.FIREX_SERVICE_ACCOUNT || "{}");
@@ -44,7 +51,6 @@ const FieldValue = admin.firestore.FieldValue;
 
 // ============================================================
 // ROOT / HEALTH CHECK — Uptime Robot isi EK route ko ping karega
-// (ab 5 alag services ki jagah sirf ek hi URL ping karna hai)
 // ============================================================
 app.get("/", (req, res) => {
   res.send("Merged backend (FireXBattle + Shubh Sankalp + ATC) is running ✅");
@@ -54,6 +60,7 @@ app.get("/ping", (req, res) => res.send("pong"));
 
 // ============================================================
 // PART 1: ZAP-WEBHOOK (payment gateway → deposit credit)
+// (Is hisse mein koi change nahi)
 // ============================================================
 function computeDepositCredit(paidAmount, offerData) {
   const amt = Number(paidAmount) || 0;
@@ -70,7 +77,7 @@ function computeDepositCredit(paidAmount, offerData) {
 
 app.post("/webhook/zapupi", async (req, res) => {
   try {
-        const raw = req.body || {};
+    const raw = req.body || {};
     const data = raw.result && typeof raw.result === "object" ? { ...raw, ...raw.result } : raw;
     console.log("[zap-webhook] Webhook body:", JSON.stringify(raw));
 
@@ -86,7 +93,7 @@ app.post("/webhook/zapupi", async (req, res) => {
       return res.status(200).json({ status: "ok", msg: "no order_id" });
     }
 
-        if (!["success", "completed", "paid", "true", "1"].includes(status)) {
+    if (!["success", "completed", "paid", "true", "1"].includes(status)) {
       console.log("[zap-webhook] Not success:", status);
       return res.status(200).json({ status: "ok" });
     }
@@ -222,97 +229,159 @@ async function notifyMatchParticipants(matchRef, title, body) {
   return participantsSnap.size;
 }
 
-firexDb.collection("deposit_requests").onSnapshot(
-  (snap) => {
-    snap.docChanges().forEach(async (change) => {
-      if (change.type !== "modified") return;
-      const d = change.doc.data();
-      if (d.notified) return;
-      if (d.status === "approved" || d.status === "rejected") {
-        await sendToUser(
-          d.uid,
-          d.status === "approved" ? "Deposit Approved" : "Deposit Rejected",
-          `Your deposit of Rs.${d.amount} was ${d.status}.`
-        );
-        await change.doc.ref.update({ notified: true });
-      }
-    });
-  },
-  (err) => console.error("[arenax-notify] deposit_requests listener error:", err)
-);
+// ------------------------------------------------------------
+// FIX #2: Listeners ab sirf "notified == false" wale documents sunte hain.
+// Pehle poori collection (saare purane documents) har restart par padhi
+// jaati thi. Ab sirf pending documents padhe jaate hain.
+//
+// ZAROORI: Firestore mein deposit_requests / withdraw_requests ke naye
+// documents mein `notified: false` field honi chahiye (jab user request
+// banata hai). Agar tumhare app mein ye field nahi banti, mujhe batao.
+// ------------------------------------------------------------
+firexDb
+  .collection("deposit_requests")
+  .where("notified", "==", false)
+  .onSnapshot(
+    (snap) => {
+      snap.docChanges().forEach(async (change) => {
+        try {
+          if (change.type !== "modified") return;
+          const d = change.doc.data();
+          if (d.notified) return;
+          if (d.status === "approved" || d.status === "rejected") {
+            await sendToUser(
+              d.uid,
+              d.status === "approved" ? "Deposit Approved" : "Deposit Rejected",
+              `Your deposit of Rs.${d.amount} was ${d.status}.`
+            );
+            await change.doc.ref.update({ notified: true });
+          }
+        } catch (err) {
+          console.error("[arenax-notify] deposit_requests handler error:", err.message);
+        }
+      });
+    },
+    (err) => console.error("[arenax-notify] deposit_requests listener error:", err)
+  );
 
-firexDb.collection("withdraw_requests").onSnapshot(
-  (snap) => {
-    snap.docChanges().forEach(async (change) => {
-      if (change.type !== "modified") return;
-      const d = change.doc.data();
-      if (d.notified) return;
-      if (d.status === "approved" || d.status === "rejected") {
-        await sendToUser(
-          d.uid,
-          d.status === "approved" ? "Withdraw Approved" : "Withdraw Rejected",
-          `Your withdraw of Rs.${d.amount} was ${d.status}.`
-        );
-        await change.doc.ref.update({ notified: true });
-      }
-    });
-  },
-  (err) => console.error("[arenax-notify] withdraw_requests listener error:", err)
-);
+firexDb
+  .collection("withdraw_requests")
+  .where("notified", "==", false)
+  .onSnapshot(
+    (snap) => {
+      snap.docChanges().forEach(async (change) => {
+        try {
+          if (change.type !== "modified") return;
+          const d = change.doc.data();
+          if (d.notified) return;
+          if (d.status === "approved" || d.status === "rejected") {
+            await sendToUser(
+              d.uid,
+              d.status === "approved" ? "Withdraw Approved" : "Withdraw Rejected",
+              `Your withdraw of Rs.${d.amount} was ${d.status}.`
+            );
+            await change.doc.ref.update({ notified: true });
+          }
+        } catch (err) {
+          console.error("[arenax-notify] withdraw_requests handler error:", err.message);
+        }
+      });
+    },
+    (err) => console.error("[arenax-notify] withdraw_requests listener error:", err)
+  );
 
-firexDb.collection("matches").onSnapshot(
-  (snap) => {
-    snap.docChanges().forEach(async (change) => {
-      if (change.type !== "modified") return;
-      const d = change.doc.data();
-      if (d.resultsDeclared === true && d.resultsNotified === false) {
-        const count = await notifyMatchParticipants(
-          change.doc.ref,
-          "Match Result Declared",
-          `Results for "${d.title || "your match"}" are out! Check your prize.`
-        );
-        await change.doc.ref.update({ resultsNotified: true });
-        console.log(
-          `[arenax-notify] Result notification sent to ${count} participant(s) for match ${change.doc.id}`
-        );
-      }
-    });
-  },
-  (err) => console.error("[arenax-notify] matches listener error:", err)
-);
+// Match result listener — ab sirf resultsNotified == false wale matches
+firexDb
+  .collection("matches")
+  .where("resultsNotified", "==", false)
+  .onSnapshot(
+    (snap) => {
+      snap.docChanges().forEach(async (change) => {
+        try {
+          if (change.type !== "modified") return;
+          const d = change.doc.data();
+          if (d.resultsDeclared === true && d.resultsNotified === false) {
+            const count = await notifyMatchParticipants(
+              change.doc.ref,
+              "Match Result Declared",
+              `Results for "${d.title || "your match"}" are out! Check your prize.`
+            );
+            await change.doc.ref.update({ resultsNotified: true });
+            console.log(
+              `[arenax-notify] Result notification sent to ${count} participant(s) for match ${change.doc.id}`
+            );
+          }
+        } catch (err) {
+          console.error("[arenax-notify] matches handler error:", err.message);
+        }
+      });
+    },
+    (err) => console.error("[arenax-notify] matches listener error:", err)
+  );
 
+// ------------------------------------------------------------
+// FIX #3 (SABSE BADA): Room notification ab Firestore ko har 20 second
+// mein POLL NAHI karta.
+//
+// Pehle: har 20 sec mein query chalti thi -> din mein 4,320 baar -> har
+//        baar saare "roomNotifSent == false" matches ke reads. Ye hi
+//        reads khaa raha tha.
+// Ab:    ek hi listener pending matches ko memory mein rakhta hai.
+//        Har 20 sec ka check sirf memory mein hota hai = 0 reads.
+//        Reads tabhi lagte hain jab koi match sach mein badalta hai.
+// ------------------------------------------------------------
 const ROOM_NOTIFY_CHECK_INTERVAL_MS = 20 * 1000;
+const pendingRoomMatches = new Map(); // matchId -> DocumentSnapshot
+const roomProcessing = new Set(); // double-send se bachne ke liye
+
+firexDb
+  .collection("matches")
+  .where("roomNotifSent", "==", false)
+  .onSnapshot(
+    (snap) => {
+      snap.docChanges().forEach((change) => {
+        if (change.type === "removed") {
+          pendingRoomMatches.delete(change.doc.id);
+        } else {
+          pendingRoomMatches.set(change.doc.id, change.doc);
+        }
+      });
+    },
+    (err) => console.error("[arenax-notify] room pending listener error:", err)
+  );
 
 async function checkAndSendRoomNotifications() {
-  try {
-    const snap = await firexDb.collection("matches").where("roomNotifSent", "==", false).get();
-    if (snap.empty) return;
-    const now = Date.now();
-
-    for (const doc of snap.docs) {
+  const now = Date.now();
+  for (const [id, doc] of pendingRoomMatches) {
+    if (roomProcessing.has(id)) continue;
+    try {
       const d = doc.data();
       const roomId = String(d.roomId || "").trim();
       const roomPassword = String(d.roomPassword || "").trim();
       if (!roomId || !roomPassword) continue;
 
-      const matchTime = d.matchDateTime && d.matchDateTime.toMillis ? d.matchDateTime.toMillis() : null;
+      const matchTime =
+        d.matchDateTime && d.matchDateTime.toMillis ? d.matchDateTime.toMillis() : null;
       if (matchTime === null) continue;
       if (matchTime > now) continue;
 
+      roomProcessing.add(id);
       const count = await notifyMatchParticipants(
         doc.ref,
         "Room ID Available",
         `Room ID & Password for "${d.title || "your match"}" is out. Match starting now!`
       );
       await doc.ref.update({ roomNotifSent: true });
-      console.log(`[arenax-notify] Room notification sent to ${count} participant(s) for match ${doc.id}`);
+      pendingRoomMatches.delete(id);
+      console.log(`[arenax-notify] Room notification sent to ${count} participant(s) for match ${id}`);
+    } catch (err) {
+      console.error("[arenax-notify] Room notification check failed:", err.message);
+    } finally {
+      roomProcessing.delete(id);
     }
-  } catch (err) {
-    console.error("[arenax-notify] Room notification check failed:", err.message);
   }
 }
 setInterval(checkAndSendRoomNotifications, ROOM_NOTIFY_CHECK_INTERVAL_MS);
-checkAndSendRoomNotifications();
 
 app.post("/send-broadcast", async (req, res) => {
   if (req.headers["x-api-key"] !== process.env.ADMIN_API_KEY) {
@@ -337,7 +406,7 @@ app.post("/send-broadcast", async (req, res) => {
 
 // ============================================================
 // PART 3: REFER-SYSTEM (referral code apply)
-// Route change ho gaya hai: /apply-referral -> /refer/apply-referral
+// (Is hisse mein koi change nahi)
 // ============================================================
 app.post("/refer/apply-referral", async (req, res) => {
   try {
@@ -435,17 +504,18 @@ app.post("/refer/apply-referral", async (req, res) => {
 
 // ============================================================
 // PART 4: SHUBH-SANKALP-NOTIFY-SERVER (leads -> push notification)
+//
+// FIX #4: Pehle pehla snapshot skip nahi ho raha tha, isliye har restart
+// par SAARE purane leads dobara "new" maan kar notification chali jaati
+// thi (crash loop mein spam). Ab pehla snapshot skip hota hai.
+// (Ye alag Firebase project hai, to ye ArenaX ke quota ka issue nahi tha.)
 // ============================================================
 let shubhIsFirstSnapshot = true;
 shubhDb.collection("leads").onSnapshot(
   (snapshot) => {
     if (shubhIsFirstSnapshot) {
       shubhIsFirstSnapshot = false;
-      // NOTE: purane code me pehla snapshot skip nahi hota tha, lekin
-      // deploy/restart ke waqt saare purane leads dobara notify na ho
-      // isliye pehla batch chhod dena safe hai (jaisa atc-notify karta hai).
-      // Agar tum bilkul original wala behaviour chahte ho (restart pe bhi
-      // pehla batch process ho), to neeche wala 'return' hata dena.
+      return;
     }
     snapshot.docChanges().forEach(async (change) => {
       if (change.type === "added") {
@@ -507,6 +577,7 @@ async function sendShubhNotificationToAllDevices(lead) {
 
 // ============================================================
 // PART 5: ATC-NOTIFY-SERVER (inquiries -> push notification)
+// (Is hisse mein koi change nahi)
 // ============================================================
 async function sendAtcNotification(title, body, data = {}) {
   const tokensSnap = await atcDb.collection("device_tokens").get();
@@ -544,7 +615,7 @@ atcDb
             "New Inquiry! 🔔",
             `${d.name || "Someone"} wants: ${d.service || "a service"}`,
             { inquiryId: change.doc.id, type: "new_inquiry" }
-          );
+          ).catch((e) => console.error("[atc-notify] send error:", e.message));
         }
       });
     },
