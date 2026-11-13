@@ -365,6 +365,13 @@ async function checkAndSendRoomNotifications() {
       if (matchTime === null) continue;
       if (matchTime > now) continue;
 
+      // Safety: 1 ghante se zyada purane match ko "match starting now" ka
+      // notification mat bhejo (quota band hone se atke purane matches ke liye)
+      if (now - matchTime > 60 * 60 * 1000) {
+        pendingRoomMatches.delete(id);
+        continue;
+      }
+
       roomProcessing.add(id);
       const count = await notifyMatchParticipants(
         doc.ref,
